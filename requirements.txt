@@ -1,0 +1,8 @@
+numpy
+streamlit
+tensorflow
+time
+zipfile
+os
+PIL
+streamlit_option_menu
