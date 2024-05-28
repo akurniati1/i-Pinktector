@@ -1,8 +1,9 @@
 numpy
-streamlit
+streamlit==1.2.0
+streamlit_option_menu==0.3.2
 tensorflow
 time
 zipfile
 os
 PIL
-streamlit_option_menu
+
