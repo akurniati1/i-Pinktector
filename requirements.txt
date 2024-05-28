@@ -2,7 +2,6 @@ numpy==1.26.4
 streamlit==1.2.0
 streamlit_option_menu==0.3.2
 tensorflow==2.16.1
-time
 zipfile
 os
 PIL
