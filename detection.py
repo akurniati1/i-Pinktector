@@ -335,7 +335,7 @@ def page_hasil_input_data():
 
     if st.button("Done", key="goback"):
         st.session_state.page = 'input'
-        st.experimental_rerun()
+        st.rerun()
 
 def app():
     # Initialize session state
@@ -350,4 +350,5 @@ def app():
 
 if __name__ == '__main__':
     app()
+
 
