@@ -122,7 +122,7 @@ def page_input_data():
 
             # Switch to the result page
             st.session_state.page = 'hasil'
-            st.experimental_rerun()
+            st.rerun()
 
 def display_prediction_result(predict_value):
     # Mengonversi nilai prediksi menjadi persentase
@@ -350,3 +350,4 @@ def app():
 
 if __name__ == '__main__':
     app()
+
