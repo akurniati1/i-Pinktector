@@ -29,7 +29,7 @@ def app():
 
     with kolom_gambar:
         image = Image.open("logo.png")
-        st.image(image, use_column_width=True)
+        st.image(image, use_container_width=True)
 
     #df = pd.read_excel(
      #   io='data.xlsx',
@@ -41,3 +41,4 @@ def app():
 
 if __name__ == '__main__':
     app()
+
