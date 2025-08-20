@@ -71,6 +71,8 @@ def page_input_data():
     st.title("Breast Cancer Detection")
     st.subheader("Mean Parameter")
     radius_mean = st.number_input("Radius Mean: ", 0.0, step=0.01, format="%.2f")
+    if radius_mean == 0.0:
+        radius_mean = None
     texture_mean = st.number_input("Texture Mean: ", 0.0, step=0.01, format="%.2f")
     perimeter_mean = st.number_input("Perimeter Mean: ", 0.0, step=0.01, format="%.2f")
     area_mean = st.number_input("Area Mean: ", 0.0, step=0.01, format="%.2f")
@@ -350,5 +352,6 @@ def app():
 
 if __name__ == '__main__':
     app()
+
 
 
