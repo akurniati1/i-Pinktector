@@ -4,18 +4,22 @@ import tensorflow as tf
 import time
 import zipfile
 import os
+import pdfplumber
+import re
+from functools import lru_cache
 
-# Replace 'file.zip' with the name of your ZIP file
+
+#Replace 'file.zip' with the name of your ZIP file
 zip_file_path = 'C-Tr-SVD.zip'
 extract_to_directory = 'C-Tr-SVD'
 
-# Extract the ZIP file
+#Extract the ZIP file
 if not os.path.exists(extract_to_directory):
     os.makedirs(extract_to_directory)
     with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to_directory)
 
-# Load the trained model using TFSMLayer
+#Load the trained model using TFSMLayer
 class SVDLayer2(tf.keras.layers.Layer):
     def __init__(self, weight, type_svd, rank, activation=None, **kwargs):
         super(SVDLayer2, self).__init__(**kwargs)
@@ -23,8 +27,6 @@ class SVDLayer2(tf.keras.layers.Layer):
         self.activation = tf.keras.activations.get(activation)
 
     def svd_decomposition(self, weight, type_svd, rank):
-        # Placeholder for the actual SVD decomposition logic
-        # Replace with the actual implementation for Ur, Sr, Vr
         Ur = np.random.rand(weight.shape[0], rank)
         Sr = np.random.rand(rank, rank)
         Vr = np.random.rand(rank, weight.shape[1])
@@ -63,286 +65,357 @@ class SVDLayer2(tf.keras.layers.Layer):
 
 model = tf.keras.layers.TFSMLayer(extract_to_directory, call_endpoint='serving_default')
 
+#Predict function
 def predict(input_features):
     prediction = model(input_features)
     return prediction
 
+#Decimal formatting
+DECIMALS = 4
+def fmt_num_dot(x: float) -> str:
+    """Format to 4 decimals using dot as decimal separator."""
+    return f"{x:.{DECIMALS}f}"
+
+#Fields & Labels
+meta_labels = {"patient_id": "Patient ID", "date": "Date"}
+
+base_params = [
+    "radius", "texture", "perimeter", "area",
+    "smoothness", "compactness", "concavity",
+    "concave_points", "symmetry", "fractal_dimension"
+]
+
+features_mean_params  = [f"{p}_mean"  for p in base_params]
+features_se_params    = [f"{p}_se"    for p in base_params]
+features_worst_params = [f"{p}_worst" for p in base_params]
+
+labels_mean_params  = {f"{p}_mean":  f"{p.replace('_',' ').title()} Mean"  for p in base_params}
+labels_se_params    = {f"{p}_se":    f"{p.replace('_',' ').title()} SE"    for p in base_params}
+labels_worst_params = {f"{p}_worst": f"{p.replace('_',' ').title()} Worst" for p in base_params}
+
+#Regex builders
+@lru_cache(maxsize=None)
+def _label_pattern(label: str) -> re.Pattern:
+    """Toleran spasi/TAB/NBSP di label & sekitar separator, menangkap angka dot/comma."""
+    parts = re.split(r"\s+", label.strip())
+    flexible_label = r"[\s\u00A0\t]+".join(map(re.escape, parts))
+    number = r"([-+]?\d+(?:[.,]\d+)?)"
+    return re.compile(
+        rf"{flexible_label}[\s\u00A0\t]*[:：=][\s\u00A0\t]*{number}",
+        flags=re.IGNORECASE
+    )
+
+@lru_cache(maxsize=None)
+def _meta_pattern(label: str) -> re.Pattern:
+    parts = re.split(r"\s+", label.strip())
+    flexible_label = r"[\s\u00A0\t]+".join(map(re.escape, parts))
+    return re.compile(
+        rf"{flexible_label}[\s\u00A0\t]*[:：=][\s\u00A0\t]*([^\n\r]+)",
+        flags=re.IGNORECASE
+    )
+
+def _parse_number(s: str):
+    try:
+        return float(s.strip().replace(",", "."))
+    except ValueError:
+        return None
+
+#PDF parsing
+ALL_LABELS = {
+    **labels_mean_params,
+    **labels_se_params,
+    **labels_worst_params,
+}
+
+def parse_pdf(file):
+    vals, meta = {}, {}
+
+    with pdfplumber.open(file) as pdf:
+        text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+
+    # normalisasi NBSP → spasi biasa
+    text = text.replace("\u00A0", " ")
+
+    # fitur (mean, se, worst) dalam satu loop
+    for key, label in ALL_LABELS.items():
+        m = _label_pattern(label).search(text)
+        if not m:
+            continue
+        num = _parse_number(m.group(1))
+        vals[key] = None if num is None else round(num, DECIMALS)
+
+    # metadata
+    for mkey, mlabel in meta_labels.items():
+        mm = _meta_pattern(mlabel).search(text)
+        if mm:
+            meta[mkey] = mm.group(1).strip()
+
+    return vals, meta
+
+#Set for read only fields
+def locked_text(label, value_key, placeholder):
+    """Read-only text input for meta/string values, shows placeholder when empty."""
+    st.text_input(
+        label,
+        value=st.session_state.get(value_key, "") or "",
+        key=f"tx_{value_key}",
+        disabled=True,
+        placeholder=placeholder,
+    )
+
+def locked_text_numeric(label, value_key):
+    """
+    Read-only text input for numeric values:
+    - When present: show with 4 decimals, using dot (e.g., 14.1200)
+    - When missing: show placeholder '00.0000'
+    """
+    v = st.session_state.get(value_key, None)
+    value_str = fmt_num_dot(float(v)) if v is not None else ""
+    st.text_input(
+        label,
+        value=value_str,
+        key=f"tx_{value_key}",
+        disabled=True,
+        placeholder="00.00",
+    )
+
+#Reset
+def _pop_state_keys(keys):
+    for k in keys:
+        st.session_state.pop(k, None)
+        st.session_state.pop(f"tx_{k}", None)
+
+def reset_app():
+    feature_keys = list(ALL_LABELS.keys())
+    meta_keys = list(meta_labels.keys())
+
+    _pop_state_keys(feature_keys + meta_keys)
+
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+
+
+
+#UI Input Data
 def page_input_data():
     st.title("Breast Cancer Detection")
-    st.subheader("Mean Parameter")
-    radius_mean = st.number_input("Radius Mean: ", 0.0, step=0.01, format="%.2f")
-    texture_mean = st.number_input("Texture Mean: ", 0.0, step=0.01, format="%.2f")
-    perimeter_mean = st.number_input("Perimeter Mean: ", 0.0, step=0.01, format="%.2f")
-    area_mean = st.number_input("Area Mean: ", 0.0, step=0.01, format="%.2f")
-    smoothness_mean = st.number_input("Smoothness Mean: ", 0.0, step=0.01, format="%.2f")
-    compactness_mean = st.number_input("Compactness Mean: ", 0.0, step=0.01, format="%.2f")
-    concavity_mean = st.number_input("Concavity Mean: ", 0.0, step=0.01, format="%.2f")
-    concave_points_mean = st.number_input("Concave Points Mean: ", 0.0, step=0.01, format="%.2f")
-    symmetry_mean = st.number_input("Symmetry Mean: ", 0.0, step=0.01, format="%.2f")
-    fractal_dimension_mean = st.number_input("Fractal Dimension Mean: ", 0.0, step=0.01, format="%.2f")
 
-    st.subheader("SE Parameter")
-    radius_se = st.number_input("Radius SE: ", 0.0, step=0.01, format="%.2f")
-    texture_se = st.number_input("Texture SE: ", 0.0, step=0.01, format="%.2f")
-    perimeter_se = st.number_input("Perimeter SE: ", 0.0, step=0.01, format="%.2f")
-    area_se = st.number_input("Area SE: ", 0.0, step=0.01, format="%.2f")
-    smoothness_se = st.number_input("Smoothness SE: ", 0.0, step=0.01, format="%.2f")
-    compactness_se = st.number_input("Compactness SE: ", 0.0, step=0.01, format="%.2f")
-    concavity_se = st.number_input("Concavity SE: ", 0.0, step=0.01, format="%.2f")
-    concave_points_se = st.number_input("Concave Points SE: ", 0.0, step=0.01, format="%.2f")
-    symmetry_se = st.number_input("Symmetry SE: ", 0.0, step=0.01, format="%.2f")
-    fractal_dimension_se = st.number_input("Fractal Dimension SE: ", 0.0, step=0.01, format="%.2f")
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0)
 
-    st.subheader("Worst Parameter")
-    radius_worst = st.number_input("Radius Worst: ", 0.0, step=0.01, format="%.2f")
-    texture_worst = st.number_input("Texture Worst: ", 0.0, step=0.01, format="%.2f")
-    perimeter_worst = st.number_input("Perimeter Worst: ", 0.0, step=0.01, format="%.2f")
-    area_worst = st.number_input("Area Worst: ", 0.0, step=0.01, format="%.2f")
-    smoothness_worst = st.number_input("Smoothness Worst: ", 0.0, step=0.01, format="%.2f")
-    compactness_worst = st.number_input("Compactness Worst: ", 0.0, step=0.01, format="%.2f")
-    concavity_worst = st.number_input("Concavity Worst: ", 0.0, step=0.01, format="%.2f")
-    concave_points_worst = st.number_input("Concave Points Worst: ", 0.0, step=0.01, format="%.2f")
-    symmetry_worst = st.number_input("Symmetry Worst: ", 0.0, step=0.01, format="%.2f")
-    fractal_dimension_worst = st.number_input("Fractal Dimension Worst: ", 0.0, step=0.01, format="%.2f")
+    uploaded = st.file_uploader(
+        "Upload PDF report",
+        type=["pdf"],
+        key=f"uploader_{st.session_state['uploader_key']}",
+    )
 
-    if st.button('Predict'):
-        with st.spinner('Predicting...'):
-            time.sleep(2)
+    if uploaded:
+        try:
+            parsed_vals, parsed_meta = parse_pdf(uploaded)
 
-            input_features = np.array([[radius_mean, texture_mean, perimeter_mean, area_mean, smoothness_mean,
-                                        compactness_mean, concavity_mean, concave_points_mean, symmetry_mean,
-                                        fractal_dimension_mean, radius_se, texture_se, perimeter_se, area_se,
-                                        smoothness_se, compactness_se, concavity_se, concave_points_se, symmetry_se,
-                                        fractal_dimension_se, radius_worst, texture_worst, perimeter_worst, area_worst,
-                                        smoothness_worst, compactness_worst, concavity_worst, concave_points_worst,
-                                        symmetry_worst, fractal_dimension_worst]])
+            # Save numbers (only if parsed)
+            for k, v in parsed_vals.items():
+                if v is not None:
+                    st.session_state[k] = v
 
-            # Save data to session state
-            st.session_state['input_features'] = input_features
+            # Save meta
+            for k, v in parsed_meta.items():
+                st.session_state[k] = v
 
-            # Switch to the result page
-            st.session_state.page = 'hasil'
-            st.rerun()
+            found_count = sum(v is not None for v in parsed_vals.values())
+            st.success(
+                f"File uploaded successfully."
+            )
+        except Exception as e:
+            st.error(f"Failed to read PDF: {e}")
 
-def display_prediction_result(predict_value):
-    # Mengonversi nilai prediksi menjadi persentase
-    percent = np.where(predict_value >= 0.5, predict_value * 100, (1 - predict_value) * 100)
-    # Mendefinisikan label kelas
-    type_prediction = {0: 'Malignant', 1: 'Benign'}
-    predicted_class = 1 if predict_value > 0.5 else 0
-    # Membuat tampilan dengan desain menarik
+    cols = st.columns(2)
+    with cols[0]:
+        locked_text("Patient ID", "patient_id", placeholder="Patient ID")
+    with cols[1]:
+        locked_text("Date", "date", placeholder="Date")
+
+    def render_section(title: str, keys: list[str], labels: dict[str, str]):
+        st.subheader(title)
+        for k in keys:
+            locked_text_numeric(f"{labels[k]} :", k)
+
+    render_section("Mean Parameters",  features_mean_params,  labels_mean_params)
+    render_section("SE Parameters",    features_se_params,    labels_se_params)
+    render_section("Worst Parameters", features_worst_params, labels_worst_params)
+
+    bcol1, bcol2 = st.columns(2)
+    with bcol1:
+        do_predict = st.button("Predict", use_container_width=True)
+    with bcol2:
+        st.button("Reset", type="secondary", on_click=reset_app, use_container_width=True)
+
+    if do_predict:
+        if not uploaded:
+            st.warning("⚠️ Please upload the PDF report first before prediction.")
+        else:
+            required_keys = features_mean_params + features_se_params + features_worst_params
+            missing_keys = [k for k in required_keys if k not in st.session_state or st.session_state[k] is None]
+
+            if missing_keys:
+                # gabungkan semua labels
+                all_labels = {}
+                all_labels.update(labels_mean_params)
+                all_labels.update(labels_se_params)
+                all_labels.update(labels_worst_params)
+
+                # buat list nama readable
+                miss_params = [all_labels.get(k, k.replace("_", " ").title()) for k in missing_keys]
+
+                st.error(
+                    "❌ The uploaded PDF is missing required parameters:\n\n"
+                    + ", ".join(miss_params)
+                )
+            else:
+                with st.spinner("Predicting…"):
+                    time.sleep(2)
+                st.session_state.page = "hasil"
+                st.rerun()
+
+
+
+#Prediction Results Page
+def getf(key: str, default: float = 0.0) -> float:
+    v = st.session_state.get(key, None)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+def display_prediction_result(predict_value: float):
+    try:
+        pv = float(np.asarray(predict_value).squeeze())
+    except Exception:
+        pv = float(predict_value)
+
+    cls = 1 if pv >= 0.5 else 0
+    confidence = pv if cls == 1 else (1 - pv)
+    percent = confidence * 100.0
+    label = {0: "Malignant", 1: "Benign"}[cls]
+
     st.markdown(
         f"""
         <div style="background-color:#f0f0f0;padding:20px;border-radius:10px;">
-            <h2 style="color:#333;text-align:center;">Prediction Results</h2>
-            <p style="text-align:center;font-size:24px;"> {percent:.2f}% {type_prediction.get(predicted_class, "Unknown")} </p>
+            <h2 style="color:#333;text-align:center;margin:0;">Prediction Results</h2>
+            <p style="text-align:center;font-size:24px;margin:6px 0 0;">
+                {percent:.2f}% {label}
+            </p>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-def page_hasil_input_data():
-    st.subheader('Details Data Entry')
+def _fmt_pretty_num(val, decimals=4):
+    if val is None:
+        return "-"
+    try:
+        s = f"{float(val):.{decimals}f}"
+        s = s.rstrip("0").rstrip(".")
+        if "." not in s:
+            s = s + ".0"
+        return s
+    except Exception:
+        return "-"
 
+def render_params_table():
     st.markdown("""
     <style>
-    @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css');
-    .data-table {
+      .nice-wrap {
+            margin-top: 1px;
+            margin-bottom: 16px;
+        }
+      table.nice {
         width: 100%;
         border-collapse: collapse;
-        margin: 25px 0;
-        font-size: 18px;
-        text-align: left;
-    }
-    .data-table th, .data-table td {
-        padding: 12px 15px;
-    }
-    .data-table th {
-        background-color: #DE2165;
-        color: #ffffff;
-        text-align: center;
-    }
-    .data-table tr {
-        border-bottom: 1px solid #dddddd;
-    }
-    .data-table tr:nth-of-type(even) {
-        background-color: #f3f3f3;
-    }
-    .data-table tr:last-of-type {
-        border-bottom: 2px solid #DE2165;
-    }
-    .data-table td {
-        text-align: center;
-    }
-    .title-with-icon {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-    .title-with-icon i {
-        color: #DE2165;
-    }
+        border-spacing: 0;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        overflow: hidden;
+      }
+      .nice thead th {
+        background: #DE2165; color: #fff; padding: 12px 16px;
+        text-align: center; font-weight: 700;
+      }
+      .nice tbody td, .nice tbody th {
+        padding: 12px 16px; border-bottom: 1px solid #e9e9e9;
+      }
+      .nice tbody tr:nth-child(even) { background: #f9f9f9; }
+      .nice tbody tr:last-child td { border-bottom: 3px solid #DE2165; }
+      .nice tbody th { text-align: left; font-weight: 600; color: #333; white-space: nowrap; }
+      .nice td.num { text-align: center; }
     </style>
     """, unsafe_allow_html=True)
 
-    # Create the table using markdown
-    table_html = """
-    <table class="data-table">
-        <thead>
-            <tr>
-                <th>Parameters</th>
-                <th>Mean</th>
-                <th>SE</th>
-                <th>Worst</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr>
-                <td>Radius</td>
-                <td>{radius_mean}</td>
-                <td>{radius_se}</td>
-                <td>{radius_worst}</td>
-            </tr>
-            <tr>
-                <td>Texture</td>
-                <td>{texture_mean}</td>
-                <td>{texture_se}</td>
-                <td>{texture_worst}</td>
-            </tr>
-            <tr>
-                <td>Perimeter</td>
-                <td>{perimeter_mean}</td>
-                <td>{perimeter_se}</td>
-                <td>{perimeter_worst}</td>
-            </tr>
-            <tr>
-                <td>Area</td>
-                <td>{area_mean}</td>
-                <td>{area_se}</td>
-                <td>{area_worst}</td>
-            </tr>
-            <tr>
-                <td>Smoothness</td>
-                <td>{smoothness_mean}</td>
-                <td>{smoothness_se}</td>
-                <td>{smoothness_worst}</td>
-            </tr>
-            <tr>
-                <td>Compactness</td>
-                <td>{compactness_mean}</td>
-                <td>{compactness_se}</td>
-                <td>{compactness_worst}</td>
-            </tr>
-            <tr>
-                <td>Concavity</td>
-                <td>{concavity_mean}</td>
-                <td>{concavity_se}</td>
-                <td>{concavity_worst}</td>
-            </tr>
-            <tr>
-                <td>Concave Points</td>
-                <td>{concave_mean}</td>
-                <td>{concave_se}</td>
-                <td>{concave_worst}</td>
-            </tr>
-            <tr>
-                <td>Symmetry</td>
-                <td>{symmetry_mean}</td>
-                <td>{symmetry_se}</td>
-                <td>{symmetry_worst}</td>
-            </tr>
-            <tr>
-                <td>Fractal Dimension</td>
-                <td>{fractal_dimension_mean}</td>
-                <td>{fractal_dimension_se}</td>
-                <td>{fractal_dimension_worst}</td>
-            </tr>
-        </tbody>
-    </table>
-    """.format(
-        radius_mean=st.session_state.get('radius_mean', '0.0'),
-        texture_mean=st.session_state.get('texture_mean', '0.0'),
-        perimeter_mean=st.session_state.get('perimeter_mean', '0.0'),
-        area_mean=st.session_state.get('area_mean', '0.0'),
-        smoothness_mean=st.session_state.get('smoothness_mean', '0.0'),
-        compactness_mean=st.session_state.get('compactness_mean', '0.0'),
-        concavity_mean=st.session_state.get('concavity_mean', '0.0'),
-        concave_mean=st.session_state.get('concave_mean', '0.0'),
-        symmetry_mean=st.session_state.get('symmetry_mean', '0.0'),
-        fractal_dimension_mean=st.session_state.get('fractal_dimension_mean', '0.0'),
-        radius_se=st.session_state.get('radius_se', '0.0'),
-        texture_se=st.session_state.get('texture_se', '0.0'),
-        perimeter_se=st.session_state.get('perimeter_se', '0.0'),
-        area_se=st.session_state.get('area_se', '0.0'),
-        smoothness_se=st.session_state.get('smoothness_se', '0.0'),
-        compactness_se=st.session_state.get('compactness_se', '0.0'),
-        concavity_se=st.session_state.get('concavity_se', '0.0'),
-        concave_se=st.session_state.get('concave_se', '0.0'),
-        symmetry_se=st.session_state.get('symmetry_se', '0.0'),
-        fractal_dimension_se=st.session_state.get('fractal_dimension_se', '0.0'),
-        radius_worst=st.session_state.get('radius_worst', '0.0'),
-        texture_worst=st.session_state.get('texture_worst', '0.0'),
-        perimeter_worst=st.session_state.get('perimeter_worst', '0.0'),
-        area_worst=st.session_state.get('area_worst', '0.0'),
-        smoothness_worst=st.session_state.get('smoothness_worst', '0.0'),
-        compactness_worst=st.session_state.get('compactness_worst', '0.0'),
-        concavity_worst=st.session_state.get('concavity_worst', '0.0'),
-        concave_worst=st.session_state.get('concave_worst', '0.0'),
-        symmetry_worst=st.session_state.get('symmetry_worst', '0.0'),
-        fractal_dimension_worst=st.session_state.get('fractal_dimension_worst', '0.0'),
-    )
+    rows_html = []
+    for p in base_params:
+        mean  = _fmt_pretty_num(st.session_state.get(f"{p}_mean"))
+        se    = _fmt_pretty_num(st.session_state.get(f"{p}_se"))
+        worst = _fmt_pretty_num(st.session_state.get(f"{p}_worst"))
+        rows_html.append(f"""
+        <tr>
+          <th>{p.replace('_',' ').title()}</th>
+          <td class="num">{mean}</td>
+          <td class="num">{se}</td>
+          <td class="num">{worst}</td>
+        </tr>""")
 
-    st.markdown(table_html, unsafe_allow_html=True)
+    html_table = f"""
+    <div class="nice-wrap">
+      <table class="nice">
+        <thead><tr><th>Parameters</th><th>Mean</th><th>SE</th><th>Worst</th></tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+      </table>
+    </div>"""
+    st.markdown(html_table, unsafe_allow_html=True)   
+    
+def page_hasil_input_data(predict_fn=None):
+    st.subheader("Details Report Patient")
 
-    input_features = st.session_state.get('input_features')
-    prediction = predict(input_features)
-    predict_value = prediction['dense_8'].numpy ().flatten()[0]
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        st.markdown(f"**Patient ID:** {st.session_state.get('patient_id', '-')}")
+    with mc2:
+        st.markdown(f"**Date:** {st.session_state.get('date', '-')}")
 
-    # Menampilkan hasil prediksi dengan desain yang menarik
-    display_prediction_result(predict_value)
+    #Table parameter display
+    render_params_table()
 
-    # Menambahkan tombol "Go Back" dengan desain yang menarik
-    st.markdown(
-        """
-        <style>
-        .btn-goback {
-            display: inline-block;
-            padding: 8px 20px;
-            font-size: 16px;
-            cursor: pointer;
-            text-align: center;
-            text-decoration: none;
-            outline: none;
-            color: #fff;
-            background-color: #007bff;
-            border: none;
-            border-radius: 5px;
-            box-shadow: 0 2px #0069d9;
-        }
+    order = features_mean_params + features_se_params + features_worst_params
+    features = np.array([[getf(k) for k in order]], dtype=np.float32)
+    st.session_state["input_features"] = features  # keep for reuse
 
-        .btn-goback:hover {
-            background-color: #0056b3;
-        }
+    _predictor = predict_fn or predict
+    try:
+        raw_pred = _predictor(features)
+        # handle tf.Tensor / np.ndarray / dict outputs
+        if isinstance(raw_pred, dict):
+            raw_pred = next(iter(raw_pred.values()))
+        raw_pred = getattr(raw_pred, "numpy", lambda: raw_pred)()
+        prob = float(np.asarray(raw_pred).squeeze())
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return
 
-        .btn-goback:active {
-            background-color: #0056b3;
-            box-shadow: 0 2px #0056b3;
-            transform: translateY(1px);
-        }
-        </style>
-        """
-    , unsafe_allow_html=True)
+    #Display prediction results
+    display_prediction_result(prob)
 
-    if st.button("Done", key="goback"):
-        st.session_state.page = 'input'
+    st.write("")
+    if st.button("Done", key="goback", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+
+        st.session_state.page = "input"
         st.rerun()
 
 def app():
-    # Initialize session state
+    #Initialize session state
     if 'page' not in st.session_state:
         st.session_state.page = 'input'
 
-    # Display the current page based on session state
+    #Display the current page based on session state
     if st.session_state.page == 'input':
         page_input_data()
     elif st.session_state.page == 'hasil':
